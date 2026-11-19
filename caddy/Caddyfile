@@ -1,0 +1,99 @@
+# Caddy + Coraza WAF in front of one backend. Generic: every app-specific
+# part comes from env or from files the Deployment mounts:
+#
+#   BACKEND                  upstream URL (required)
+#   FORWARDED_PROTO/_PORT    sent upstream as X-Forwarded-Proto/-Port
+#   TRUSTED_PROXIES          CIDRs whose X-Forwarded-For is believed
+#   BLOCKING_PARANOIA        CRS paranoia level
+#   ANOMALY_INBOUND          CRS inbound anomaly threshold
+#   ALLOWED_METHODS          CRS tx.allowed_methods
+#   REQ_BODY_NOFILES_LIMIT   max bytes of a request body without file uploads
+#   REQ_BODY_LIMIT_ACTION    Reject or ProcessPartial past the total limit
+#   RULE_ENGINE              On, or DetectionOnly to log without blocking
+#
+#   /etc/caddy-waf/rules/*.conf    SecLang exclusions, loaded before CRS
+#   /etc/caddy-waf/site.d/*.caddy  handlers run before the WAF (rate limits)
+#   /etc/caddy-waf/proxy.d/*.caddy extra reverse_proxy subdirectives
+{
+	admin off
+	auto_https off
+	persist_config off
+	servers {
+		# HTTP/1.1 only: the Gateway talks HTTP/1.1 to us, and no h2c.
+		protocols h1
+		# Envoy appends the real client as the last X-Forwarded-For entry.
+		# Strict mode reads right to left, so a client cannot spoof it.
+		trusted_proxies static {$TRUSTED_PROXIES:10.42.0.0/16}
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+:8080 {
+	# Access log without query strings, Referer or credentials: queries and
+	# Referer carry API keys and OAuth codes.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "\?.*$" ""
+				request>headers>Referer delete
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Api-Key delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+
+	route {
+		# Kubelet probes, answered before the WAF.
+		respond /healthz "ok" 200
+
+		import /etc/caddy-waf/site.d/*.caddy
+
+		# Cap bodies without file uploads, the job SecRequestBodyNoFilesLimit
+		# does in ModSecurity. Coraza 3.8 parses that directive but ignores it
+		# (corazawaf/coraza#896), and inspecting a large form body costs ~3 s
+		# of CPU per MB. A declared length over the cap is refused up front;
+		# request_body stops chunked bodies, mapped to 413 in handle_errors.
+		@nofiles not header Content-Type multipart/form-data*
+		@nofiles_too_big {
+			not header Content-Type multipart/form-data*
+			expression `{http.request.header.Content-Length}.matches("^[0-9]+$") && int({http.request.header.Content-Length}) > {$REQ_BODY_NOFILES_LIMIT:1048576}`
+		}
+		respond @nofiles_too_big 413
+		request_body @nofiles {
+			max_size {$REQ_BODY_NOFILES_LIMIT:1048576}
+		}
+
+		coraza_waf {
+			directives `
+				Include /etc/caddy-waf/coraza.conf
+				SecRuleEngine {$RULE_ENGINE:On}
+				SecRequestBodyLimitAction {$REQ_BODY_LIMIT_ACTION:Reject}
+				SecAction "id:900000,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',setvar:tx.blocking_paranoia_level={$BLOCKING_PARANOIA:1}"
+				SecAction "id:900110,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',setvar:tx.inbound_anomaly_score_threshold={$ANOMALY_INBOUND:5},setvar:tx.outbound_anomaly_score_threshold=4"
+				SecAction "id:900200,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',setvar:'tx.allowed_methods={$ALLOWED_METHODS:GET HEAD POST OPTIONS}'"
+				SecAction "id:900500,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',setvar:tx.crs_skip_response_analysis=1"
+				SecAction "id:900990,phase:1,pass,t:none,nolog,tag:'OWASP_CRS',setvar:tx.crs_setup_version=4300"
+				Include /etc/caddy-waf/rules/*.conf
+				Include /etc/caddy-waf/crs/rules/*.conf
+			`
+		}
+
+		reverse_proxy {$BACKEND} {
+			header_up X-Forwarded-Proto {$FORWARDED_PROTO:https}
+			header_up X-Forwarded-Port {$FORWARDED_PORT:443}
+			# Stream responses (video, SSE) instead of buffering them.
+			flush_interval -1
+			import /etc/caddy-waf/proxy.d/*.caddy
+		}
+	}
+
+	handle_errors {
+		@body_too_big expression `{err.message}.contains("request body too large")`
+		respond @body_too_big 413
+	}
+}
