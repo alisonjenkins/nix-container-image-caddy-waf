@@ -69,13 +69,18 @@
         };
       };
 
+      smoke-test = pkgs.writeShellApplication {
+        name = "smoke-test";
+        runtimeInputs = with pkgs; [coreutils curl gnugrep python3];
+        text = builtins.readFile ./tests/smoke-test.sh;
+      };
     in {
       packages = {
-        inherit caddy config container;
+        inherit caddy config container smoke-test;
         default = container;
       };
 
-      checks = {inherit config;};
+      checks = {inherit config smoke-test;};
 
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [just podman skopeo shellcheck];

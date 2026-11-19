@@ -1,0 +1,13 @@
+# Login throttle keyed on the client address Caddy derives from the last
+# X-Forwarded-For entry.
+rate_limit {
+	zone login {
+		match {
+			method POST
+			path /ui/login/*
+		}
+		key {client_ip}
+		events 10
+		window 1m
+	}
+}
